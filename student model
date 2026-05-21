@@ -1,0 +1,323 @@
+# ============================================================
+# 1. IMPORTS
+# ============================================================
+
+import tensorflow as tf
+import numpy as np
+from tensorflow.keras import layers, models
+from tensorflow.keras.applications import MobileNetV3Small
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+import os
+
+print("Eager mode:", tf.executing_eagerly())
+
+# ============================================================
+# 2. DATA GENERATORS (CXR STUDENT)
+# ============================================================
+
+IMG_SIZE = (224,224)
+BATCH_SIZE = 32
+EMBED_DIM = 256
+
+cxr_train_path = "/content/drive/MyDrive/Dataset/CXR/train"
+cxr_val_path   = "/content/drive/MyDrive/Dataset/CXR/val"
+
+datagen = ImageDataGenerator(rescale=1./255)
+
+cxr_train = datagen.flow_from_directory(
+    cxr_train_path,
+    target_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    class_mode='sparse',
+    shuffle=True
+)
+
+cxr_val = datagen.flow_from_directory(
+    cxr_val_path,
+    target_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    class_mode='sparse',
+    shuffle=False
+)
+
+num_classes = cxr_train.num_classes
+
+print("Classes:", cxr_train.class_indices)
+
+# ============================================================
+# 3. LOAD FROZEN CT TEACHER
+# ============================================================
+
+teacher_path = "/content/drive/MyDrive/saved_models_MACAI/ct_teacher.keras"
+
+teacher = tf.keras.models.load_model(
+    teacher_path,
+    compile=False
+)
+
+teacher.trainable = False
+
+print("Teacher loaded successfully")
+
+# ============================================================
+# 4. REBUILD TEACHER FOR EMBEDDING EXTRACTION
+# ============================================================
+
+# Teacher penultimate embedding
+teacher_embedding_model = tf.keras.Model(
+    inputs=teacher.input,
+    outputs=[
+        teacher.get_layer("Z_CT").output,
+        teacher.get_layer("p_CT").output
+    ]
+)
+
+teacher_embedding_model.trainable = False
+
+# ============================================================
+# 5. BUILD CXR STUDENT NETWORK
+# ============================================================
+
+student_base = MobileNetV3Small(
+    include_top=False,
+    weights="imagenet",
+    input_shape=(224,224,3)
+)
+
+student_inputs = layers.Input(shape=(224,224,3))
+
+x = student_base(student_inputs)
+
+x = layers.GlobalAveragePooling2D()(x)
+
+x = layers.BatchNormalization()(x)
+
+# Student semantic embedding
+Z_S = layers.Dense(
+    EMBED_DIM,
+    activation="relu"
+)(x)
+
+Z_S = layers.Dropout(0.3)(Z_S)
+
+Z_S = layers.Activation(
+    "linear",
+    name="Z_S"
+)(Z_S)
+
+# Student logits
+student_logits = layers.Dense(
+    num_classes,
+    name="student_logits"
+)(Z_S)
+
+# Softmax prediction
+p_S = layers.Activation(
+    "softmax",
+    name="p_S"
+)(student_logits)
+
+student = models.Model(
+    student_inputs,
+    [student_logits, p_S, Z_S]
+)
+
+student.summary()
+
+# ============================================================
+# 6. KD HYPERPARAMETERS
+# ============================================================
+
+TEMPERATURE = 4.0
+
+LAMBDA_1 = 1.0
+LAMBDA_2 = 0.7
+LAMBDA_3 = 0.2
+
+optimizer = tf.keras.optimizers.AdamW(
+    learning_rate=1e-4,
+    weight_decay=1e-5
+)
+
+# ============================================================
+# 7. LOSS FUNCTIONS
+# ============================================================
+
+ce_loss_fn = tf.keras.losses.SparseCategoricalCrossentropy()
+
+kl_loss_fn = tf.keras.losses.KLDivergence()
+
+mse_loss_fn = tf.keras.losses.MeanSquaredError()
+
+# ============================================================
+# 8. TRAIN STEP
+# ============================================================
+
+train_acc_metric = tf.keras.metrics.SparseCategoricalAccuracy()
+
+val_acc_metric = tf.keras.metrics.SparseCategoricalAccuracy()
+
+@tf.function
+def train_step(images, labels):
+
+    # --------------------------------------------------------
+    # Teacher Forward Pass (Frozen)
+    # --------------------------------------------------------
+
+    Z_T, p_T = teacher_embedding_model(images, training=False)
+
+    # Teacher confidence weight
+    w = tf.reduce_max(p_T, axis=1)
+
+    # Temperature-scaled teacher probabilities
+    teacher_soft = tf.nn.softmax(
+        tf.math.log(p_T + 1e-8) / TEMPERATURE,
+        axis=1
+    )
+
+    with tf.GradientTape() as tape:
+
+        # ----------------------------------------------------
+        # Student Forward Pass
+        # ----------------------------------------------------
+
+        student_logits, p_S, Z_S = student(
+            images,
+            training=True
+        )
+
+        # ----------------------------------------------------
+        # Ground Truth Classification Loss
+        # ----------------------------------------------------
+
+        L_cls = ce_loss_fn(labels, p_S)
+
+        # ----------------------------------------------------
+        # Temperature-scaled Student Distribution
+        # ----------------------------------------------------
+
+        student_soft = tf.nn.softmax(
+            student_logits / TEMPERATURE,
+            axis=1
+        )
+
+        # ----------------------------------------------------
+        # Confidence-Adaptive KD Loss
+        # ----------------------------------------------------
+
+        kd_per_sample = tf.keras.losses.kullback_leibler_divergence(
+            teacher_soft,
+            student_soft
+        )
+
+        L_kd = tf.reduce_mean(w * kd_per_sample)
+
+        # ----------------------------------------------------
+        # Semantic Alignment Loss
+        # ----------------------------------------------------
+
+        sem_per_sample = tf.reduce_mean(
+            tf.square(Z_S - Z_T),
+            axis=1
+        )
+
+        L_sem = tf.reduce_mean(w * sem_per_sample)
+
+        # ----------------------------------------------------
+        # Total Loss
+        # ----------------------------------------------------
+
+        total_loss = (
+            LAMBDA_1 * L_cls +
+            LAMBDA_2 * (TEMPERATURE**2) * L_kd +
+            LAMBDA_3 * L_sem
+        )
+
+    # --------------------------------------------------------
+    # Backpropagation ONLY through student
+    # --------------------------------------------------------
+
+    grads = tape.gradient(
+        total_loss,
+        student.trainable_variables
+    )
+
+    optimizer.apply_gradients(
+        zip(grads, student.trainable_variables)
+    )
+
+    train_acc_metric.update_state(labels, p_S)
+
+    return total_loss
+
+# ============================================================
+# 9. VALIDATION STEP
+# ============================================================
+
+@tf.function
+def val_step(images, labels):
+
+    _, p_S, _ = student(
+        images,
+        training=False
+    )
+
+    val_acc_metric.update_state(labels, p_S)
+
+# ============================================================
+# 10. TRAINING LOOP
+# ============================================================
+
+EPOCHS = 50
+
+for epoch in range(EPOCHS):
+
+    print(f"\nEpoch {epoch+1}/{EPOCHS}")
+
+    # --------------------------------------------------------
+    # TRAINING
+    # --------------------------------------------------------
+
+    for images, labels in cxr_train:
+
+        loss = train_step(images, labels)
+
+    train_acc = train_acc_metric.result()
+
+    print(
+        f"Train Loss: {loss:.4f} | "
+        f"Train Accuracy: {train_acc:.4f}"
+    )
+
+    # --------------------------------------------------------
+    # VALIDATION
+    # --------------------------------------------------------
+
+    for images, labels in cxr_val:
+
+        val_step(images, labels)
+
+    val_acc = val_acc_metric.result()
+
+    print(
+        f"Validation Accuracy: {val_acc:.4f}"
+    )
+
+    # Reset metrics
+    train_acc_metric.reset_states()
+    val_acc_metric.reset_states()
+
+# ============================================================
+# 11. SAVE STUDENT MODEL
+# ============================================================
+
+save_dir = "/content/drive/MyDrive/saved_models_MACAI"
+
+os.makedirs(save_dir, exist_ok=True)
+
+student.save(
+    os.path.join(save_dir, "cxr_student_kd.keras"),
+    include_optimizer=False
+)
+
+print("CXR Student saved successfully")
