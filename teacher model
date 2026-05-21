@@ -1,0 +1,165 @@
+# ============================================================
+# CONFIDENCE-AWARE KD – TEACHER TRAINING (ResNet50 + Gabor)
+# ============================================================
+
+import tensorflow as tf
+import numpy as np
+import os
+from tensorflow.keras import layers, models
+from tensorflow.keras.applications import ResNet50
+from tensorflow.keras.applications.resnet50 import preprocess_input
+from tensorflow.keras.preprocessing.image import ImageDataGenerator
+
+print("Eager mode:", tf.executing_eagerly())
+
+# ============================================================
+# SETTINGS
+# ============================================================
+
+IMG_SIZE = (224,224)
+BATCH_SIZE = 32
+EPOCHS = 10
+
+train_path = "/content/drive/MyDrive/Dataset/CXR/train"
+val_path   = "/content/drive/MyDrive/Dataset/CXR/val"
+
+# ============================================================
+# DATA GENERATORS
+# ============================================================
+
+datagen = ImageDataGenerator(rescale=1./255)
+
+train_gen = datagen.flow_from_directory(
+    train_path,
+    target_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    class_mode='sparse',
+    shuffle=True
+)
+
+val_gen = datagen.flow_from_directory(
+    val_path,
+    target_size=IMG_SIZE,
+    batch_size=BATCH_SIZE,
+    class_mode='sparse',
+    shuffle=False
+)
+
+num_classes = train_gen.num_classes
+print("Classes:", train_gen.class_indices)
+
+# ============================================================
+# GABOR LAYER
+# ============================================================
+
+class GaborLayer(layers.Layer):
+    def build(self, input_shape):
+        ksize = 11
+        sigma = 3.0
+        lambd = 6.0
+        gamma = 0.5
+        thetas = [0, np.pi/4, np.pi/2]
+
+        kernels = []
+        half = ksize // 2
+
+        for theta in thetas:
+            y, x = np.meshgrid(
+                np.arange(-half, half+1),
+                np.arange(-half, half+1)
+            )
+
+            x_theta = x*np.cos(theta) + y*np.sin(theta)
+            y_theta = -x*np.sin(theta) + y*np.cos(theta)
+
+            gabor = np.exp(
+                -(x_theta**2 + gamma**2*y_theta**2) /
+                (2*sigma**2)
+            ) * np.cos(2*np.pi*x_theta/lambd)
+
+            gabor = gabor[..., np.newaxis, np.newaxis]
+            kernels.append(gabor)
+
+        kernels = np.concatenate(kernels, axis=-1)
+        kernels = np.repeat(kernels, input_shape[-1], axis=2)
+
+        self.kernels = tf.constant(kernels, dtype=tf.float32)
+
+    def call(self, inputs):
+        return tf.nn.conv2d(inputs, self.kernels, strides=1, padding="SAME")
+
+# ============================================================
+# BUILD TEACHER (ResNet50)
+# ============================================================
+
+base_model = ResNet50(
+    include_top=False,
+    weights="imagenet",
+    input_shape=(224,224,3)
+)
+
+# Freeze backbone for stable supervised training
+for layer in base_model.layers:
+    layer.trainable = False
+
+inputs = layers.Input(shape=(224,224,3))
+
+# Gabor preprocessing
+x = GaborLayer(name="gabor_ct")(inputs)
+
+# Project to 3 channels for ResNet
+x = layers.Conv2D(3, kernel_size=1, padding="same")(x)
+
+# ResNet normalization
+x = preprocess_input(x)
+
+# Feature extraction
+x = base_model(x, training=False)
+x = layers.GlobalAveragePooling2D()(x)
+x = layers.BatchNormalization()(x)
+
+# Latent embedding (for later KD semantic alignment)
+Z_CT = layers.Dense(256, activation="relu")(x)
+Z_CT = layers.Dropout(0.4)(Z_CT)
+Z_CT = layers.Activation("linear", name="Z_CT")(Z_CT)
+
+# Classification output
+p_CT = layers.Dense(num_classes, activation="softmax", name="p_CT")(Z_CT)
+
+ct_teacher = models.Model(inputs, p_CT)
+
+ct_teacher.summary()
+
+# ============================================================
+# COMPILE
+# ============================================================
+
+ct_teacher.compile(
+    optimizer=tf.keras.optimizers.AdamW(1e-4, weight_decay=1e-5),
+    loss="sparse_categorical_crossentropy",
+    metrics=["accuracy"]
+)
+
+# ============================================================
+# TRAIN
+# ============================================================
+
+history = ct_teacher.fit(
+    train_gen,
+    validation_data=val_gen,
+    epochs=EPOCHS
+)
+
+# ============================================================
+# SAVE MODEL
+# ============================================================
+
+save_dir = "/content/drive/MyDrive/saved_models_MACAI"
+os.makedirs(save_dir, exist_ok=True)
+
+ct_teacher.save(
+    os.path.join(save_dir, "ct_teacher_resnet50.keras"),
+    include_optimizer=False
+)
+
+print("Teacher model saved successfully.")
